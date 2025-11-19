@@ -119,36 +119,44 @@ export default async function downloadPhotos(context) {
     context.log(`✅ Fetched ${photoDocuments.length} photo documents`);
 
     // 4️⃣ Stream each file into the ZIP
-    let successCount = 0;
-    let errorCount = 0;
+  // 4️⃣ Stream each file into the ZIP
+let successCount = 0;
+let errorCount = 0;
 
-    for (const [index, photoDoc] of photoDocuments.entries()) {
-      try {
-        const fileId = photoDoc.file_id;
-        const fileType = photoDoc.file_type || 'jpg';
-        const photoId = photoDoc.$id;
-        
-        // Generate unique filename
-        const filename = `photo_${photoId}.${fileType}`;
-        
-        context.log(`📸 [${index + 1}/${photoDocuments.length}] Processing: ${filename}`);
+for (const [index, photoDoc] of photoDocuments.entries()) {
+  try {
+    const fileId = photoDoc.file_id;
+    const fileType = photoDoc.file_type || 'jpg';
+    const photoId = photoDoc.$id;
+    
+    // Generate unique filename
+    const filename = `photo_${photoId}.${fileType}`;
+    
+    context.log(`📸 [${index + 1}/${photoDocuments.length}] Processing: ${filename}`);
 
-        // Get file download stream from Appwrite
-        const fileBuffer = await storage.getFileDownload(bucketId, fileId);
-        
-        // Add to archive
-        archive.append(fileBuffer, { name: filename });
-        
-        successCount++;
-        context.log(`✅ [${index + 1}/${photoDocuments.length}] Added: ${filename}`);
-        
-      } catch (err) {
-        errorCount++;
-        context.error(`❌ Failed to add photo ${photoDoc.$id}: ${err.message}`);
-        // Continue with other files
-      }
-    }
-
+    // Get file download from Appwrite (returns Uint8Array)
+    const fileData = await storage.getFileDownload(bucketId, fileId);
+    
+    // Convert to Buffer if needed
+    const fileBuffer = Buffer.isBuffer(fileData) 
+      ? fileData 
+      : Buffer.from(fileData);
+    
+    context.log(`📦 File size: ${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB`);
+    
+    // Add to archive
+    archive.append(fileBuffer, { name: filename });
+    
+    successCount++;
+    context.log(`✅ [${index + 1}/${photoDocuments.length}] Added: ${filename}`);
+    
+  } catch (err) {
+    errorCount++;
+    context.error(`❌ Failed to add photo ${photoDoc.$id}: ${err.message}`);
+    context.error('Error stack:', err.stack);
+    // Continue with other files
+  }
+}
     // 5️⃣ Finalize the archive and wait for completion
     context.log('🔹 Finalizing ZIP archive...');
 
