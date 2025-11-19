@@ -38,8 +38,11 @@ export default async function prepareDownload(context) {
   const PHOTO_BUCKET = process.env.APPWRITE_BUCKET_ID;
   const DOWNLOAD_BUCKET = process.env.APPWRITE_DOWNLOAD_BUCKET_ID;
 
-  // Logged-in user
   const currentUserId = context.req.headers["x-appwrite-user-id"];
+
+  if (!currentUserId) {
+    return context.res.json({ statusCode: 401, error: "Unauthorized - User not logged in" });
+  }
 
   try {
     // --------------------------------------------
@@ -55,47 +58,66 @@ export default async function prepareDownload(context) {
     }
 
     // --------------------------------------------
-    // Fetch all photos from DB
+    // Fetch all photos from DB (Optimized)
     // --------------------------------------------
+    context.log(`📸 Fetching photos for event: ${eventId}`);
     const allPhotos = [];
     let offset = 0;
+    const BATCH_SIZE = 100;
 
     while (true) {
       const res = await databases.listDocuments(DB, PHOTO_COLLECTION, [
         Query.equal("event_id", eventId),
-        Query.limit(100),
+        Query.limit(BATCH_SIZE),
         Query.offset(offset),
+        Query.select(["$id", "file_id", "file_size", "file_type", "file_name"]),
       ]);
 
       if (!res.documents.length) break;
 
       allPhotos.push(...res.documents);
       offset += res.documents.length;
+
+      // Safety check to prevent infinite loops
+      if (offset > 10000) {
+        context.log("⚠️ Photo limit reached (10,000)");
+        break;
+      }
     }
 
     if (allPhotos.length === 0) {
-      return context.res.json({ statusCode: 404, error: "No photos found" });
+      return context.res.json({ statusCode: 404, error: "No photos found for this event" });
     }
+
+    context.log(`✅ Found ${allPhotos.length} photos`);
 
     // --------------------------------------------
     // ZIP chunking config
     // --------------------------------------------
-    const MAX_MB = 2048; // 2GB limit
+    const MAX_MB = 2000; // 2GB limit with buffer
+    const MIN_FILES_PER_ZIP = 1; // Minimum files before creating new chunk
     let currentZipSizeMB = 0;
     let currentZipFileCount = 0;
     let zipIndex = 1;
+    let totalProcessed = 0;
 
     let archive = null;
     let zipChunks = null;
     let zipStream = null;
 
     const createdDownloads = [];
+    const failedPhotos = [];
 
     // --------------------------------------------
     // Helper: Start new ZIP
     // --------------------------------------------
     const startZip = () => {
-      archive = archiver("zip", { zlib: { level: 0 } });
+      context.log(`📦 Starting ZIP part ${zipIndex}...`);
+      archive = archiver("zip", { 
+        zlib: { level: 0 }, // No compression for speed
+        statConcurrency: 1
+      });
+      
       zipChunks = [];
       zipStream = new Writable({
         write(chunk, enc, cb) {
@@ -103,7 +125,23 @@ export default async function prepareDownload(context) {
           cb();
         },
       });
+
       archive.pipe(zipStream);
+
+      // Error handling for archiver
+      archive.on("error", (err) => {
+        context.error(`❌ Archive error: ${err.message}`);
+        throw err;
+      });
+
+      archive.on("warning", (err) => {
+        if (err.code === "ENOENT") {
+          context.log(`⚠️ Archive warning: ${err.message}`);
+        } else {
+          throw err;
+        }
+      });
+
       currentZipSizeMB = 0;
       currentZipFileCount = 0;
     };
@@ -112,13 +150,23 @@ export default async function prepareDownload(context) {
     // Helper: Finalize & upload ZIP
     // --------------------------------------------
     const finalizeAndUploadZip = async () => {
+      context.log(`🔒 Finalizing ZIP part ${zipIndex} (${currentZipFileCount} files, ${currentZipSizeMB.toFixed(2)}MB)`);
+      
       await archive.finalize();
       await new Promise((resolve) => zipStream.on("finish", resolve));
 
       const zipBuffer = Buffer.concat(zipChunks);
-      const zipFilename =
-        (eventDoc.event_name || "photos") +
-        (zipIndex > 1 ? `_part_${zipIndex}.zip` : `.zip`);
+      const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
+      
+      const eventName = (eventDoc.event_name || "photos")
+        .replace(/[^a-zA-Z0-9_-]/g, "_")
+        .substring(0, 50);
+      
+      const zipFilename = zipIndex > 1 
+        ? `${eventName}_part${zipIndex}.zip` 
+        : `${eventName}.zip`;
+
+      context.log(`⬆️ Uploading ${zipFilename} (${zipSizeMB}MB)...`);
 
       // Upload file
       const fileId = `dl_${eventId}_${Date.now()}_${zipIndex}`;
@@ -141,22 +189,44 @@ export default async function prepareDownload(context) {
         fileObj,
         [
           Permission.read(Role.user(currentUserId)),
+          Permission.update(Role.user(currentUserId)),
           Permission.delete(Role.user(currentUserId)),
         ]
       );
 
-      // Create download DB record
-      const dlDoc = await databases.createDocument(DB, DL_COLLECTION, "unique()", {
-        user_id: currentUserId,
-        event_id: eventId,
-        file_id: uploaded.$id,
-        file_name: zipFilename,
-        size_mb: (zipBuffer.length / 1024 / 1024).toFixed(2),
-        photo_count: currentZipFileCount,
-        chunk_index: zipIndex,
-      });
+      context.log(`✅ File uploaded: ${uploaded.$id}`);
 
-      createdDownloads.push(dlDoc.$id);
+      // Create download DB record with metadata
+      const dlDoc = await databases.createDocument(
+        DB, 
+        DL_COLLECTION, 
+        "unique()", 
+        {
+          user_id: currentUserId,
+          event_id: eventId,
+          file_id: uploaded.$id,
+          file_name: zipFilename,
+          size_mb: parseFloat(zipSizeMB),
+          photo_count: currentZipFileCount,
+          chunk_index: zipIndex,
+          status: "ready",
+          created_at: new Date().toISOString(),
+        },
+        [
+          Permission.read(Role.user(currentUserId)),
+          Permission.update(Role.user(currentUserId)),
+          Permission.delete(Role.user(currentUserId)),
+        ]
+      );
+
+      context.log(`✅ Database record created: ${dlDoc.$id}`);
+      createdDownloads.push({
+        id: dlDoc.$id,
+        fileId: uploaded.$id,
+        filename: zipFilename,
+        sizeMB: parseFloat(zipSizeMB),
+        photoCount: currentZipFileCount,
+      });
 
       zipIndex++;
     };
@@ -169,45 +239,95 @@ export default async function prepareDownload(context) {
     // --------------------------------------------
     // Process photos one by one
     // --------------------------------------------
-    for (const photo of allPhotos) {
-      const fileId = photo.file_id;
-      const sizeMB = parseFloat(photo.file_size || 0);
+    context.log(`🔄 Processing ${allPhotos.length} photos...`);
+    
+    for (let i = 0; i < allPhotos.length; i++) {
+      const photo = allPhotos[i];
+      totalProcessed++;
 
-      // If adding this file exceeds 2GB → close current ZIP & start new
-      if (currentZipSizeMB + sizeMB > MAX_MB && currentZipFileCount > 0) {
-        await finalizeAndUploadZip();
-        startZip();
+      try {
+        const fileId = photo.file_id;
+        const sizeMB = parseFloat(photo.file_size || 0);
+
+        // Log progress every 50 photos
+        if (totalProcessed % 50 === 0) {
+          context.log(`📊 Progress: ${totalProcessed}/${allPhotos.length} photos processed`);
+        }
+
+        // If adding this file exceeds limit → close current ZIP & start new
+        if (currentZipSizeMB + sizeMB > MAX_MB && currentZipFileCount >= MIN_FILES_PER_ZIP) {
+          await finalizeAndUploadZip();
+          startZip();
+        }
+
+        // Download file from storage
+        const data = await storage.getFileDownload(PHOTO_BUCKET, fileId);
+        const buffer = Buffer.from(data);
+
+        // Determine file extension
+        const ext = photo.file_type?.replace("image/", "") || 
+                   photo.file_name?.split(".").pop() || 
+                   "jpg";
+        
+        const filename = photo.file_name || `photo_${photo.$id}.${ext}`;
+
+        // Add to archive
+        archive.append(buffer, {
+          name: filename,
+          date: new Date(photo.$createdAt || Date.now()),
+        });
+
+        currentZipSizeMB += sizeMB;
+        currentZipFileCount++;
+
+      } catch (err) {
+        context.error(`❌ Failed to process photo ${photo.$id}: ${err.message}`);
+        failedPhotos.push({
+          id: photo.$id,
+          error: err.message,
+        });
+        // Continue processing remaining photos
       }
-
-      // Download file (Uint8Array)
-      const data = await storage.getFileDownload(PHOTO_BUCKET, fileId);
-      const buffer = Buffer.from(data); // convert Uint8Array → Buffer
-
-      const ext = photo.file_type || "jpg";
-      archive.append(buffer, {
-        name: `photo_${photo.$id}.${ext}`,
-      });
-
-      currentZipSizeMB += sizeMB;
-      currentZipFileCount++;
     }
 
-    // Final ZIP if it has files
+    // Finalize last ZIP if it has files
     if (currentZipFileCount > 0) {
       await finalizeAndUploadZip();
     }
 
     // --------------------------------------------
-    // Respond
+    // Final Response
     // --------------------------------------------
-    return context.res.json({
+    const responseData = {
       statusCode: 200,
       message: "Download prepared successfully",
-      chunks: createdDownloads.length,
-      downloadIds: createdDownloads,
-    });
+      summary: {
+        totalPhotos: allPhotos.length,
+        processedPhotos: totalProcessed - failedPhotos.length,
+        failedPhotos: failedPhotos.length,
+        totalChunks: createdDownloads.length,
+        totalSizeMB: createdDownloads.reduce((sum, dl) => sum + dl.sizeMB, 0).toFixed(2),
+      },
+      downloads: createdDownloads,
+    };
+
+    if (failedPhotos.length > 0) {
+      responseData.failures = failedPhotos;
+      responseData.message += ` (${failedPhotos.length} photos failed)`;
+    }
+
+    context.log(`🎉 Download preparation complete!`);
+    return context.res.json(responseData);
+
   } catch (err) {
-    context.error(err);
-    return context.res.json({ statusCode: 500, error: err.message });
+    context.error(`❌ Critical error: ${err.message}`);
+    context.error(err.stack);
+    
+    return context.res.json({ 
+      statusCode: 500, 
+      error: "Internal server error",
+      message: err.message,
+      details: process.env.NODE_ENV === "development" ? err.stack : undefined,
+    });
   }
 }
