@@ -202,7 +202,7 @@ export default async function prepareDownload(context) {
           user_id: currentUserId,
           event_id: eventId,
           file_id: uploadedFile.$id,
-          filename: zipFilename,
+          file_name: zipFilename,
           size_mb: parseFloat(zipSizeMB),
           photo_count: chunk.length,
           chunk_index: chunkIndex + 1,
