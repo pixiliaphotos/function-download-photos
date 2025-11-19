@@ -176,13 +176,24 @@ export default async function prepareDownload(context) {
 const downloadFileId = `download_${Date.now()}_${chunkIndex}`;
 context.log(`📤 Uploading to download bucket: ${downloadFileId}`);
 
-// Convert buffer to Blob for upload
-const blob = new Blob([zipBuffer], { type: 'application/zip' });
+// Create a file-like object that Appwrite SDK expects
+const fileObject = {
+  name: zipFilename,
+  type: 'application/zip',
+  size: zipBuffer.length,
+  arrayBuffer: async () => zipBuffer.buffer.slice(
+    zipBuffer.byteOffset,
+    zipBuffer.byteOffset + zipBuffer.byteLength
+  ),
+  slice: (start, end) => {
+    return new Blob([zipBuffer.slice(start, end)], { type: 'application/zip' });
+  }
+};
 
 const uploadedFile = await storage.createFile(
   downloadBucketId,
   downloadFileId,
-  blob,
+  fileObject,
   [
     Permission.read(Role.user(currentUserId)),
     Permission.delete(Role.user(currentUserId))
