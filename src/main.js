@@ -2,6 +2,17 @@ import archiver from 'archiver';
 import { Writable } from 'stream';
 import { Client, Storage, Databases, Query, Permission, Role } from 'node-appwrite';
 
+/**
+ * Convert Appwrite Node.js ReadableStream → Buffer
+ */
+const streamToBuffer = async (stream) =>
+  new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", reject);
+  });
+
 export default async function prepareDownload(context) {
   context.log('🔹 Starting download preparation function...');
 
@@ -10,24 +21,17 @@ export default async function prepareDownload(context) {
   // -----------------------------
   let payload = {};
   try {
-    context.log('📥 Parsing request body...');
     if (context.req.bodyRaw) {
       payload = JSON.parse(context.req.bodyRaw);
-      context.log('✅ Request body parsed:', payload);
     }
   } catch (err) {
-    context.error('❌ Invalid JSON in request body: ' + err.message);
     return context.res.json({ statusCode: 400, error: 'Invalid JSON in request body' });
   }
 
   const { eventId } = payload;
-
   if (!eventId) {
-    context.error('❌ Missing eventId in request body');
     return context.res.json({ statusCode: 400, error: 'Missing eventId' });
   }
-
-  context.log(`📌 Event ID: ${eventId}`);
 
   // -----------------------------
   // Init Appwrite
@@ -36,8 +40,6 @@ export default async function prepareDownload(context) {
     .setEndpoint(process.env.APPWRITE_ENDPOINT)
     .setProject(process.env.APPWRITE_PROJECT_ID)
     .setKey(process.env.APPWRITE_API_KEY);
-
-  context.log('🔗 Appwrite client initialized');
 
   const storage = new Storage(client);
   const databases = new Databases(client);
@@ -52,34 +54,24 @@ export default async function prepareDownload(context) {
   // -----------------------------
   // Verify user
   // -----------------------------
-  const headers = context.req.headers;
-  const currentUserId = headers['x-appwrite-user-id'];
-  context.log(`👤 Current user ID from headers: ${currentUserId}`);
+  const currentUserId = context.req.headers['x-appwrite-user-id'];
 
   try {
     // -----------------------------
     // Verify event ownership
     // -----------------------------
-    context.log(`🔹 Verifying event ownership for ${eventId}...`);
     const eventDoc = await databases.getDocument(databaseId, eventCollectionId, eventId);
 
-    const eventUserId = String(eventDoc.user_id || '').trim();
-    context.log(`🔑 Event owner: ${eventUserId}`);
-
-    if (eventUserId !== currentUserId) {
-      context.error(`❌ Ownership mismatch: ${eventUserId} ≠ ${currentUserId}`);
+    if (String(eventDoc.user_id) !== String(currentUserId)) {
       return context.res.json({
         statusCode: 403,
         error: 'Forbidden – you do not own this event',
       });
     }
 
-    context.log(`🔒 Ownership verified for user ${currentUserId}`);
-
     // -----------------------------
     // Fetch all photos
     // -----------------------------
-    context.log(`🔹 Fetching all photos for event ${eventId}...`);
     const allPhotos = [];
     let offset = 0;
     const batchSize = 100;
@@ -96,8 +88,6 @@ export default async function prepareDownload(context) {
       allPhotos.push(...result.documents);
       offset += result.documents.length;
 
-      context.log(`📄 Fetched ${result.documents.length} photos (total: ${allPhotos.length})`);
-
       if (result.documents.length < batchSize) break;
     }
 
@@ -105,10 +95,8 @@ export default async function prepareDownload(context) {
       return context.res.json({ statusCode: 404, error: 'No photos found' });
     }
 
-    context.log(`✅ Total photos: ${allPhotos.length}`);
-
     // -----------------------------
-    // Chunk into 2GB groups
+    // Chunk photos into 2GB groups
     // -----------------------------
     const MAX_CHUNK_MB = 2048;
     const chunks = [];
@@ -129,10 +117,8 @@ export default async function prepareDownload(context) {
     }
     if (currentChunk.length > 0) chunks.push(currentChunk);
 
-    context.log(`📦 Created ${chunks.length} chunk(s)`);
-
     // -----------------------------
-    // Process chunks
+    // Process ZIP chunks
     // -----------------------------
     const createdDownloads = [];
 
@@ -143,9 +129,7 @@ export default async function prepareDownload(context) {
           ? `${eventDoc.event_name || 'photos'}_part_${i + 1}.zip`
           : `${eventDoc.event_name || 'photos'}.zip`;
 
-      context.log(`🔹 Processing ZIP chunk ${i + 1}/${chunks.length}`);
-
-      // --- Create ZIP archive ---
+      // Create archive
       const archive = archiver('zip', { zlib: { level: 0 } });
       const zipChunks = [];
 
@@ -157,22 +141,17 @@ export default async function prepareDownload(context) {
       });
 
       archive.pipe(zipStream);
+      archive.on("error", (err) => { throw err; });
 
-      archive.on('error', (err) => {
-        throw err;
-      });
-
-      // --- Add photos ---
-      for (const [idx, photo] of chunk.entries()) {
+      // Add photos
+      for (const photo of chunk) {
         try {
           const fileId = photo.file_id;
           const type = photo.file_type || 'jpg';
           const filename = `photo_${photo.$id}.${type}`;
 
-          context.log(`📸 Adding photo: ${filename}`);
-
           const stream = await storage.getFileDownload(photoBucketId, fileId);
-          const buffer = Buffer.from(await stream.arrayBuffer());
+          const buffer = await streamToBuffer(stream);
 
           archive.append(buffer, { name: filename });
         } catch (err) {
@@ -180,17 +159,15 @@ export default async function prepareDownload(context) {
         }
       }
 
-      // --- Finalize ZIP ---
+      // Finalize ZIP
       await archive.finalize();
-      await new Promise((resolve) => zipStream.on('finish', resolve));
+      await new Promise((resolve) => zipStream.on("finish", resolve));
 
       const zipBuffer = Buffer.concat(zipChunks);
       const zipMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
 
-      context.log(`✅ ZIP created (${zipMB} MB)`);
-
       // -----------------------------
-      // Upload ZIP
+      // Upload ZIP to Appwrite
       // -----------------------------
       const downloadFileId = `download_${Date.now()}_${i}`;
 
@@ -204,7 +181,9 @@ export default async function prepareDownload(context) {
             zipBuffer.byteOffset + zipBuffer.byteLength
           ),
         slice: (start, end) =>
-          new Blob([zipBuffer.slice(start, end)], { type: 'application/zip' })
+          new Blob([zipBuffer.slice(start, end)], {
+            type: 'application/zip'
+          })
       };
 
       const uploadedFile = await storage.createFile(
@@ -217,10 +196,8 @@ export default async function prepareDownload(context) {
         ]
       );
 
-      context.log(`📤 Uploaded: ${uploadedFile.$id}`);
-
       // -----------------------------
-      // Record in DB
+      // Create DB download record
       // -----------------------------
       const downloadDoc = await databases.createDocument(
         databaseId,
@@ -239,9 +216,11 @@ export default async function prepareDownload(context) {
       );
 
       createdDownloads.push(downloadDoc.$id);
-      context.log(`📝 Created DB record: ${downloadDoc.$id}`);
     }
 
+    // -----------------------------
+    // Final response
+    // -----------------------------
     return context.res.json({
       statusCode: 200,
       message: 'Download prepared successfully',
