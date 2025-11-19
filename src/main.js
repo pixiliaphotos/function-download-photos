@@ -1,5 +1,5 @@
 import archiver from 'archiver';
-import { Client, Storage, Databases, Query } from 'node-appwrite';
+import { Client, Storage, Databases, Query, InputFile, Permission, Role } from 'node-appwrite';
 
 export default async function downloadPhotos(context) {
   context.log('🔹 Starting photo download function...');
@@ -45,7 +45,7 @@ export default async function downloadPhotos(context) {
   const databaseId = process.env.APPWRITE_DATABASE_ID;
   const photoCollectionId = process.env.APPWRITE_PHOTO_COLLECTION_ID;
   const bucketId = process.env.APPWRITE_BUCKET_ID;
-
+  const downloadBucketId = process.env.APPWRITE_DOWNLOAD_BUCKET_ID;
   // Verify user ownership
   const headers = context.req.headers;
   const currentUserId = headers['x-appwrite-user-id'];
@@ -168,20 +168,45 @@ for (const [index, photoDoc] of photoDocuments.entries()) {
     context.log(`✅ ZIP creation completed successfully`);
     context.log(`📊 Summary: ${successCount} successful, ${errorCount} failed`);
 
-    // 6️⃣ Combine chunks and send response
+// 6️⃣ Upload ZIP to storage and return download URL
 const zipBuffer = Buffer.concat(chunks);
 const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
 context.log(`📦 ZIP file: ${zipFilename} (${zipSizeMB} MB)`);
 
-// Convert to base64 for safe transport
-const base64Zip = zipBuffer.toString('base64');
-
-return context.res.json({
-  statusCode: 200,
-  zipData: base64Zip,
-  filename: zipFilename,
-  sizeMB: zipSizeMB,
-}, 200);
+try {
+  // Upload ZIP to storage bucket
+  const tempFileId = `temp_${Date.now()}_${chunkIndex}`;
+  context.log(`📤 Uploading ZIP to storage with ID: ${tempFileId}`);
+  
+  const uploadedFile = await storage.createFile(
+    downloadBucketId,
+    tempFileId,
+    InputFile.fromBuffer(zipBuffer, zipFilename),
+    [
+      Permission.read(Role.user(currentUserId)),
+      Permission.delete(Role.user(currentUserId))
+    ]
+  );
+  
+  context.log(`✅ ZIP uploaded to storage: ${uploadedFile.$id}`);
+  
+  // Get download URL
+  const downloadUrl = `${process.env.APPWRITE_ENDPOINT}/storage/buckets/${bucketId}/files/${uploadedFile.$id}/download?project=${process.env.APPWRITE_PROJECT_ID}`;
+  
+  context.log(`🔗 Download URL generated`);
+  
+  return context.res.json({
+    statusCode: 200,
+    fileId: uploadedFile.$id,
+    downloadUrl: downloadUrl,
+    filename: zipFilename,
+    sizeMB: zipSizeMB,
+  }, 200);
+  
+} catch (uploadError) {
+  context.error(`❌ Failed to upload ZIP to storage: ${uploadError.message}`);
+  throw uploadError;
+}
 
   } catch (error) {
     context.error('❌ Error creating ZIP: ' + error.message);
