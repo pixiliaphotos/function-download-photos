@@ -70,7 +70,7 @@ export default async function prepareDownload(context) {
         Query.equal("event_id", eventId),
         Query.limit(BATCH_SIZE),
         Query.offset(offset),
-        Query.select(["$id", "file_id", "file_size", "file_type", "file_name"]),
+        Query.select(["$id", "file_id", "file_size", "file_type"]),
       ]);
 
       if (!res.documents.length) break;
@@ -264,12 +264,11 @@ export default async function prepareDownload(context) {
         const data = await storage.getFileDownload(PHOTO_BUCKET, fileId);
         const buffer = Buffer.from(data);
 
-        // Determine file extension
-        const ext = photo.file_type?.replace("image/", "") || 
-                   photo.file_name?.split(".").pop() || 
-                   "jpg";
+        // Determine file extension from file_type (e.g., "image/jpeg" -> "jpeg")
+        const ext = photo.file_type?.replace("image/", "").replace("jpg", "jpeg") || "jpeg";
         
-        const filename = photo.file_name || `photo_${photo.$id}.${ext}`;
+        // Generate filename using photo ID and extension
+        const filename = `photo_${photo.$id}.${ext}`;
 
         // Add to archive
         archive.append(buffer, {
