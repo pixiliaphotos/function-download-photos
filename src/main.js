@@ -1,5 +1,5 @@
 import archiver from 'archiver';
-import { Client, Storage, Databases, Query, InputFile, Permission, Role } from 'node-appwrite';
+import { Client, Storage, Databases, Query, Permission, Role } from 'node-appwrite';
 
 export default async function downloadPhotos(context) {
   context.log('🔹 Starting photo download function...');
@@ -178,10 +178,24 @@ try {
   const tempFileId = `temp_${Date.now()}_${chunkIndex}`;
   context.log(`📤 Uploading ZIP to storage with ID: ${tempFileId}`);
   
+  // Create a Blob/File-like object for upload
+  const file = {
+    name: zipFilename,
+    type: 'application/zip',
+    size: zipBuffer.length,
+    stream: () => {
+      const { Readable } = require('stream');
+      const readable = new Readable();
+      readable.push(zipBuffer);
+      readable.push(null);
+      return readable;
+    }
+  };
+  
   const uploadedFile = await storage.createFile(
-    downloadBucketId,
+    bucketId,
     tempFileId,
-    InputFile.fromBuffer(zipBuffer, zipFilename),
+    file,
     [
       Permission.read(Role.user(currentUserId)),
       Permission.delete(Role.user(currentUserId))
@@ -205,6 +219,7 @@ try {
   
 } catch (uploadError) {
   context.error(`❌ Failed to upload ZIP to storage: ${uploadError.message}`);
+  context.error('Upload error stack:', uploadError.stack);
   throw uploadError;
 }
 
