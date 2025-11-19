@@ -1,41 +1,28 @@
-import archiver from 'archiver';
-import { Writable } from 'stream';
-import { Client, Storage, Databases, Query, Permission, Role } from 'node-appwrite';
-
-/**
- * Convert Appwrite Node.js ReadableStream → Buffer
- */
-const streamToBuffer = async (stream) =>
-  new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on("data", (chunk) => chunks.push(chunk));
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", reject);
-  });
+import archiver from "archiver";
+import { Writable } from "stream";
+import { Client, Storage, Databases, Query, Permission, Role } from "node-appwrite";
 
 export default async function prepareDownload(context) {
-  context.log('🔹 Starting download preparation function...');
+  context.log("🔹 Starting download preparation…");
 
-  // -----------------------------
-  // Parse request body
-  // -----------------------------
+  // --------------------------------------------
+  // Parse Request Body
+  // --------------------------------------------
   let payload = {};
   try {
-    if (context.req.bodyRaw) {
-      payload = JSON.parse(context.req.bodyRaw);
-    }
-  } catch (err) {
-    return context.res.json({ statusCode: 400, error: 'Invalid JSON in request body' });
+    payload = JSON.parse(context.req.bodyRaw || "{}");
+  } catch (e) {
+    return context.res.json({ statusCode: 400, error: "Invalid JSON" });
   }
 
   const { eventId } = payload;
   if (!eventId) {
-    return context.res.json({ statusCode: 400, error: 'Missing eventId' });
+    return context.res.json({ statusCode: 400, error: "Missing eventId" });
   }
 
-  // -----------------------------
+  // --------------------------------------------
   // Init Appwrite
-  // -----------------------------
+  // --------------------------------------------
   const client = new Client()
     .setEndpoint(process.env.APPWRITE_ENDPOINT)
     .setProject(process.env.APPWRITE_PROJECT_ID)
@@ -44,136 +31,100 @@ export default async function prepareDownload(context) {
   const storage = new Storage(client);
   const databases = new Databases(client);
 
-  const databaseId = process.env.APPWRITE_DATABASE_ID;
-  const photoCollectionId = process.env.APPWRITE_PHOTO_COLLECTION_ID;
-  const eventCollectionId = process.env.APPWRITE_EVENT_COLLECTION_ID;
-  const downloadCollectionId = process.env.APPWRITE_DOWNLOAD_COLLECTION_ID;
-  const photoBucketId = process.env.APPWRITE_BUCKET_ID;
-  const downloadBucketId = process.env.APPWRITE_DOWNLOAD_BUCKET_ID;
+  const DB = process.env.APPWRITE_DATABASE_ID;
+  const PHOTO_COLLECTION = process.env.APPWRITE_PHOTO_COLLECTION_ID;
+  const EVENT_COLLECTION = process.env.APPWRITE_EVENT_COLLECTION_ID;
+  const DL_COLLECTION = process.env.APPWRITE_DOWNLOAD_COLLECTION_ID;
+  const PHOTO_BUCKET = process.env.APPWRITE_BUCKET_ID;
+  const DOWNLOAD_BUCKET = process.env.APPWRITE_DOWNLOAD_BUCKET_ID;
 
-  // -----------------------------
-  // Verify user
-  // -----------------------------
-  const currentUserId = context.req.headers['x-appwrite-user-id'];
+  // Logged-in user
+  const currentUserId = context.req.headers["x-appwrite-user-id"];
 
   try {
-    // -----------------------------
-    // Verify event ownership
-    // -----------------------------
-    const eventDoc = await databases.getDocument(databaseId, eventCollectionId, eventId);
+    // --------------------------------------------
+    // Check event ownership
+    // --------------------------------------------
+    const eventDoc = await databases.getDocument(DB, EVENT_COLLECTION, eventId);
 
     if (String(eventDoc.user_id) !== String(currentUserId)) {
       return context.res.json({
         statusCode: 403,
-        error: 'Forbidden – you do not own this event',
+        error: "Forbidden — you do not own this event.",
       });
     }
 
-    // -----------------------------
-    // Fetch all photos
-    // -----------------------------
+    // --------------------------------------------
+    // Fetch all photos from DB
+    // --------------------------------------------
     const allPhotos = [];
     let offset = 0;
-    const batchSize = 100;
 
     while (true) {
-      const result = await databases.listDocuments(databaseId, photoCollectionId, [
-        Query.equal('event_id', eventId),
-        Query.limit(batchSize),
+      const res = await databases.listDocuments(DB, PHOTO_COLLECTION, [
+        Query.equal("event_id", eventId),
+        Query.limit(100),
         Query.offset(offset),
       ]);
 
-      if (result.documents.length === 0) break;
+      if (!res.documents.length) break;
 
-      allPhotos.push(...result.documents);
-      offset += result.documents.length;
-
-      if (result.documents.length < batchSize) break;
+      allPhotos.push(...res.documents);
+      offset += res.documents.length;
     }
 
     if (allPhotos.length === 0) {
-      return context.res.json({ statusCode: 404, error: 'No photos found' });
+      return context.res.json({ statusCode: 404, error: "No photos found" });
     }
 
-    // -----------------------------
-    // Chunk photos into 2GB groups
-    // -----------------------------
-    const MAX_CHUNK_MB = 2048;
-    const chunks = [];
-    let currentChunk = [];
-    let size = 0;
+    // --------------------------------------------
+    // ZIP chunking config
+    // --------------------------------------------
+    const MAX_MB = 2048; // 2GB limit
+    let currentZipSizeMB = 0;
+    let currentZipFileCount = 0;
+    let zipIndex = 1;
 
-    for (const p of allPhotos) {
-      const s = parseFloat(p.file_size || 0);
+    let archive = null;
+    let zipChunks = null;
+    let zipStream = null;
 
-      if (size + s > MAX_CHUNK_MB && currentChunk.length > 0) {
-        chunks.push(currentChunk);
-        currentChunk = [];
-        size = 0;
-      }
-
-      currentChunk.push(p);
-      size += s;
-    }
-    if (currentChunk.length > 0) chunks.push(currentChunk);
-
-    // -----------------------------
-    // Process ZIP chunks
-    // -----------------------------
     const createdDownloads = [];
 
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const zipFilename =
-        chunks.length > 1
-          ? `${eventDoc.event_name || 'photos'}_part_${i + 1}.zip`
-          : `${eventDoc.event_name || 'photos'}.zip`;
-
-      // Create archive
-      const archive = archiver('zip', { zlib: { level: 0 } });
-      const zipChunks = [];
-
-      const zipStream = new Writable({
+    // --------------------------------------------
+    // Helper: Start new ZIP
+    // --------------------------------------------
+    const startZip = () => {
+      archive = archiver("zip", { zlib: { level: 0 } });
+      zipChunks = [];
+      zipStream = new Writable({
         write(chunk, enc, cb) {
           zipChunks.push(chunk);
           cb();
-        }
+        },
       });
-
       archive.pipe(zipStream);
-      archive.on("error", (err) => { throw err; });
+      currentZipSizeMB = 0;
+      currentZipFileCount = 0;
+    };
 
-      // Add photos
-      for (const photo of chunk) {
-        try {
-          const fileId = photo.file_id;
-          const type = photo.file_type || 'jpg';
-          const filename = `photo_${photo.$id}.${type}`;
-
-          const stream = await storage.getFileDownload(photoBucketId, fileId);
-          const buffer = await streamToBuffer(stream);
-
-          archive.append(buffer, { name: filename });
-        } catch (err) {
-          context.error(`❌ Failed photo ${photo.$id}: ${err.message}`);
-        }
-      }
-
-      // Finalize ZIP
+    // --------------------------------------------
+    // Helper: Finalize & upload ZIP
+    // --------------------------------------------
+    const finalizeAndUploadZip = async () => {
       await archive.finalize();
       await new Promise((resolve) => zipStream.on("finish", resolve));
 
       const zipBuffer = Buffer.concat(zipChunks);
-      const zipMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
+      const zipFilename =
+        (eventDoc.event_name || "photos") +
+        (zipIndex > 1 ? `_part_${zipIndex}.zip` : `.zip`);
 
-      // -----------------------------
-      // Upload ZIP to Appwrite
-      // -----------------------------
-      const downloadFileId = `download_${Date.now()}_${i}`;
-
-      const fileObject = {
+      // Upload file
+      const fileId = `dl_${eventId}_${Date.now()}_${zipIndex}`;
+      const fileObj = {
         name: zipFilename,
-        type: 'application/zip',
+        type: "application/zip",
         size: zipBuffer.length,
         arrayBuffer: async () =>
           zipBuffer.buffer.slice(
@@ -181,55 +132,82 @@ export default async function prepareDownload(context) {
             zipBuffer.byteOffset + zipBuffer.byteLength
           ),
         slice: (start, end) =>
-          new Blob([zipBuffer.slice(start, end)], {
-            type: 'application/zip'
-          })
+          new Blob([zipBuffer.slice(start, end)], { type: "application/zip" }),
       };
 
-      const uploadedFile = await storage.createFile(
-        downloadBucketId,
-        downloadFileId,
-        fileObject,
+      const uploaded = await storage.createFile(
+        DOWNLOAD_BUCKET,
+        fileId,
+        fileObj,
         [
           Permission.read(Role.user(currentUserId)),
           Permission.delete(Role.user(currentUserId)),
         ]
       );
 
-      // -----------------------------
-      // Create DB download record
-      // -----------------------------
-      const downloadDoc = await databases.createDocument(
-        databaseId,
-        downloadCollectionId,
-        'unique()',
-        {
-          user_id: currentUserId,
-          event_id: eventId,
-          file_id: uploadedFile.$id,
-          file_name: zipFilename,
-          size_mb: parseFloat(zipMB),
-          photo_count: chunk.length,
-          chunk_index: i + 1,
-          total_chunks: chunks.length,
-        }
-      );
+      // Create download DB record
+      const dlDoc = await databases.createDocument(DB, DL_COLLECTION, "unique()", {
+        user_id: currentUserId,
+        event_id: eventId,
+        file_id: uploaded.$id,
+        file_name: zipFilename,
+        size_mb: (zipBuffer.length / 1024 / 1024).toFixed(2),
+        photo_count: currentZipFileCount,
+        chunk_index: zipIndex,
+      });
 
-      createdDownloads.push(downloadDoc.$id);
+      createdDownloads.push(dlDoc.$id);
+
+      zipIndex++;
+    };
+
+    // --------------------------------------------
+    // Begin first ZIP
+    // --------------------------------------------
+    startZip();
+
+    // --------------------------------------------
+    // Process photos one by one
+    // --------------------------------------------
+    for (const photo of allPhotos) {
+      const fileId = photo.file_id;
+      const sizeMB = parseFloat(photo.file_size || 0);
+
+      // If adding this file exceeds 2GB → close current ZIP & start new
+      if (currentZipSizeMB + sizeMB > MAX_MB && currentZipFileCount > 0) {
+        await finalizeAndUploadZip();
+        startZip();
+      }
+
+      // Download file (Uint8Array)
+      const data = await storage.getFileDownload(PHOTO_BUCKET, fileId);
+      const buffer = Buffer.from(data); // convert Uint8Array → Buffer
+
+      const ext = photo.file_type || "jpg";
+      archive.append(buffer, {
+        name: `photo_${photo.$id}.${ext}`,
+      });
+
+      currentZipSizeMB += sizeMB;
+      currentZipFileCount++;
     }
 
-    // -----------------------------
-    // Final response
-    // -----------------------------
+    // Final ZIP if it has files
+    if (currentZipFileCount > 0) {
+      await finalizeAndUploadZip();
+    }
+
+    // --------------------------------------------
+    // Respond
+    // --------------------------------------------
     return context.res.json({
       statusCode: 200,
-      message: 'Download prepared successfully',
-      totalChunks: chunks.length,
+      message: "Download prepared successfully",
+      chunks: createdDownloads.length,
       downloadIds: createdDownloads,
     });
-
-  } catch (error) {
-    context.error('❌ Error preparing download:', error);
-    return context.res.json({ statusCode: 500, error: error.message });
+  } catch (err) {
+    context.error(err);
+    return context.res.json({ statusCode: 500, error: err.message });
   }
 }
