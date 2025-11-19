@@ -118,7 +118,6 @@ export default async function downloadPhotos(context) {
     
     context.log(`✅ Fetched ${photoDocuments.length} photo documents`);
 
-    // 4️⃣ Stream each file into the ZIP
   // 4️⃣ Stream each file into the ZIP
 let successCount = 0;
 let errorCount = 0;
@@ -170,16 +169,19 @@ for (const [index, photoDoc] of photoDocuments.entries()) {
     context.log(`📊 Summary: ${successCount} successful, ${errorCount} failed`);
 
     // 6️⃣ Combine chunks and send response
-    const zipBuffer = Buffer.concat(chunks);
-    const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
-    context.log(`📦 ZIP file: ${zipFilename} (${zipSizeMB} MB)`);
+const zipBuffer = Buffer.concat(chunks);
+const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
+context.log(`📦 ZIP file: ${zipFilename} (${zipSizeMB} MB)`);
 
-    return context.res.send(zipBuffer, 200, {
-      'Content-Type': 'application/zip',
-      'Content-Disposition': `attachment; filename="${zipFilename}"`,
-      'Content-Length': zipBuffer.length.toString(),
-      'Cache-Control': 'no-cache',
-    });
+// Convert to base64 for safe transport
+const base64Zip = zipBuffer.toString('base64');
+
+return context.res.json({
+  statusCode: 200,
+  zipData: base64Zip,
+  filename: zipFilename,
+  sizeMB: zipSizeMB,
+}, 200);
 
   } catch (error) {
     context.error('❌ Error creating ZIP: ' + error.message);
