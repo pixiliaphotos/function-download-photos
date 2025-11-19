@@ -69,23 +69,22 @@ export default async function downloadPhotos(context) {
     }
     context.log(`🔒 Ownership verified for user ${currentUserId}`);
 
-    // 2️⃣ Set response headers for streaming ZIP
+    // 2️⃣ Create archiver instance and buffer
     const zipFilename = `photos_part_${chunkIndex + 1}.zip`;
     context.log(`📦 Creating ZIP file: ${zipFilename}`);
-    
-    context.res.send('', 200, {
-      'Content-Type': 'application/zip',
-      'Content-Disposition': `attachment; filename="${zipFilename}"`,
-      'Cache-Control': 'no-cache',
-    });
 
-    // 3️⃣ Create archiver instance
     context.log('🔹 Initializing archiver...');
     const archive = archiver('zip', {
       zlib: { level: 0 } // No compression - photos already compressed
     });
 
-    // Handle archiver warnings and errors
+    // Collect ZIP data in chunks
+    const chunks = [];
+
+    archive.on('data', (chunk) => {
+      chunks.push(chunk);
+    });
+
     archive.on('warning', (err) => {
       if (err.code === 'ENOENT') {
         context.log('⚠️ Archive warning:', err.message);
@@ -99,10 +98,7 @@ export default async function downloadPhotos(context) {
       throw err;
     });
 
-    // Pipe archive to response
-    archive.pipe(context.res);
-
-    // 4️⃣ Fetch photo documents to get file metadata
+    // 3️⃣ Fetch photo documents to get file metadata
     context.log(`🔹 Fetching photo documents for ${photoIds.length} photos...`);
     const photoDocuments = [];
     
@@ -122,7 +118,7 @@ export default async function downloadPhotos(context) {
     
     context.log(`✅ Fetched ${photoDocuments.length} photo documents`);
 
-    // 5️⃣ Stream each file into the ZIP
+    // 4️⃣ Stream each file into the ZIP
     let successCount = 0;
     let errorCount = 0;
 
@@ -153,13 +149,29 @@ export default async function downloadPhotos(context) {
       }
     }
 
-    // 6️⃣ Finalize the archive
+    // 5️⃣ Finalize the archive and wait for completion
     context.log('🔹 Finalizing ZIP archive...');
-    await archive.finalize();
-    
+
+    await new Promise((resolve, reject) => {
+      archive.on('end', resolve);
+      archive.on('error', reject);
+      archive.finalize();
+    });
+
     context.log(`✅ ZIP creation completed successfully`);
     context.log(`📊 Summary: ${successCount} successful, ${errorCount} failed`);
-    context.log(`📦 ZIP file: ${zipFilename}`);
+
+    // 6️⃣ Combine chunks and send response
+    const zipBuffer = Buffer.concat(chunks);
+    const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
+    context.log(`📦 ZIP file: ${zipFilename} (${zipSizeMB} MB)`);
+
+    return context.res.send(zipBuffer, 200, {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': `attachment; filename="${zipFilename}"`,
+      'Content-Length': zipBuffer.length.toString(),
+      'Cache-Control': 'no-cache',
+    });
 
   } catch (error) {
     context.error('❌ Error creating ZIP: ' + error.message);
