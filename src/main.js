@@ -172,24 +172,22 @@ export default async function prepareDownload(context) {
       const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
       context.log(`✅ ZIP created: ${zipSizeMB} MB`);
 
-      // 5️⃣ Upload to download bucket
-      const downloadFileId = `download_${Date.now()}_${chunkIndex}`;
-      context.log(`📤 Uploading to download bucket: ${downloadFileId}`);
+     // 5️⃣ Upload to download bucket
+const downloadFileId = `download_${Date.now()}_${chunkIndex}`;
+context.log(`📤 Uploading to download bucket: ${downloadFileId}`);
 
-      const { Readable } = require('stream');
-      const readable = new Readable();
-      readable.push(zipBuffer);
-      readable.push(null);
+// Convert buffer to Blob for upload
+const blob = new Blob([zipBuffer], { type: 'application/zip' });
 
-      const uploadedFile = await storage.createFile(
-        downloadBucketId,
-        downloadFileId,
-        readable,
-        [
-          Permission.read(Role.user(currentUserId)),
-          Permission.delete(Role.user(currentUserId))
-        ]
-      );
+const uploadedFile = await storage.createFile(
+  downloadBucketId,
+  downloadFileId,
+  blob,
+  [
+    Permission.read(Role.user(currentUserId)),
+    Permission.delete(Role.user(currentUserId))
+  ]
+);
 
       context.log(`✅ Uploaded: ${uploadedFile.$id}`);
 
